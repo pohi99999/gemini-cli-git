@@ -285,7 +285,7 @@ To identify problems effectively:
 ### File Naming
 Use descriptive, timestamped filenames:
 - Format: `YYYY-MM-DD-health-check.md`
-- Example: `2025-11-22-health-check.md`
+- Example: `2024-01-15-health-check.md`
 
 ### Location
 Save all reports to: `memory/skills/repo_health_check/output/`
@@ -298,7 +298,7 @@ Maintain a metadata file to track health history:
 {
   "checks": [
     {
-      "date": "2025-11-22T22:00:00Z",
+      "date": "2024-01-15T22:00:00Z",
       "repository": "mcp-brunella-core",
       "status": "healthy|issues|critical",
       "issues_found": 3,
@@ -324,7 +324,7 @@ Maintain a metadata file to track health history:
 Skip health check if:
 - Repository clone/update fails (network issues, access denied)
 - Repository has been archived or deleted
-- Previous check completed within last 6 hours (prevent duplicate runs)
+- Previous check completed within last 2 hours (prevent duplicate runs)
 - Repository is in maintenance mode (check README or status page)
 
 ## Example Workflow

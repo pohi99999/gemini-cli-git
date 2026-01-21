@@ -120,7 +120,7 @@ Follow all guidelines from `memory/skills/repo_health_check/knowledge/GUIDELINES
 
 Skip execution if:
 - **Repository unavailable**: Cannot clone or update the repository (network issues, access denied, repo deleted/archived)
-- **Recent check**: A health check was completed within the last 6 hours
+- **Recent check**: A health check was completed within the last 2 hours (prevents duplicate runs)
 - **Maintenance mode**: Repository is in declared maintenance mode
 - **System issues**: Git or file system errors prevent execution
 
