@@ -14,12 +14,14 @@ The **HOW** is defined in the `repo_health_check` skill's guidelines.
 
 ## Task Instructions
 
-Perform a comprehensive health check of the [mcp-brunella-core](https://github.com/[OWNER]/mcp-brunella-core) repository to identify any problems and provide actionable suggestions for fixes.
+Perform a comprehensive health check of the mcp-brunella-core repository to identify any problems and provide actionable suggestions for fixes.
 
 ### Specifics
 
-- **Target Repository**: https://github.com/[OWNER]/mcp-brunella-core
-  - Note: Update [OWNER] with the actual repository owner/organization
+- **Target Repository**: mcp-brunella-core
+  - Note: You will need to search for or identify the correct GitHub owner/organization for this repository
+  - Use GitHub search or API to locate the repository if needed
+  - Example URL format: https://github.com/[owner]/mcp-brunella-core
 - **Analysis Approach**: Clone/update the repository and perform comprehensive health checks
 - **Output Location**: `memory/skills/repo_health_check/output/`
 - **Output Filename**: Use format `YYYY-MM-DD-health-check.md` where date is the check execution date

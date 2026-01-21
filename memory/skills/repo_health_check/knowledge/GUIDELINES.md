@@ -29,11 +29,14 @@ REPO_DIR="/tmp/target-repo"
 TARGET_REPO="mcp-brunella-core"  # Or from demand file
 
 # Clone or update the repository
+# First, search for the repository or use the configured owner
 if [ -d "$REPO_DIR" ]; then
   cd "$REPO_DIR"
   git pull origin main
 else
-  git clone "https://github.com/[OWNER]/$TARGET_REPO" "$REPO_DIR"
+  # Note: You'll need to determine the correct owner/organization
+  # You can search GitHub or use a configured value
+  git clone "https://github.com/{owner}/$TARGET_REPO" "$REPO_DIR"
 fi
 
 cd "$REPO_DIR"
