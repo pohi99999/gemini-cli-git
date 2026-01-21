@@ -1,0 +1,497 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'Agent on Issues/Comments'
+
+# Universal entrypoint for all @gemini interactions
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  handle-request:
+    # Only run if comment/issue mentions @gemini
+    if: |
+      contains(github.event.issue.body, '@gemini') ||
+      contains(github.event.comment.body || '', '@gemini') ||
+      contains(github.event.review.body || '', '@gemini')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Determine context'
+        id: context
+        run: |
+          # Determine if this is an issue or PR
+          if [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            echo "type=pr_comment" >> $GITHUB_OUTPUT
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "is_pr=true" >> $GITHUB_OUTPUT
+          elif [ -n "${{ github.event.issue.pull_request }}" ]; then
+            echo "type=pr_comment" >> $GITHUB_OUTPUT
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "is_pr=true" >> $GITHUB_OUTPUT
+          else
+            echo "type=issue" >> $GITHUB_OUTPUT
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "is_pr=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 'Checkout repository'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 'Get PR branch and checkout (if PR)'
+        if: steps.context.outputs.is_pr == 'true'
+        id: pr_info
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ steps.context.outputs.number }}"
+          PR_INFO=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER)
+          PR_BRANCH=$(echo "$PR_INFO" | jq -r '.head.ref')
+          echo "branch=$PR_BRANCH" >> $GITHUB_OUTPUT
+
+          # Checkout the PR branch
+          git fetch origin "$PR_BRANCH"
+          git checkout "$PR_BRANCH"
+
+      - name: 'Setup Git'
+        run: |
+          git config user.name "Agent Bot"
+          git config user.email "agent-bot@users.noreply.github.com"
+
+      - name: 'Prepare context for agent'
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          mkdir -p tmp
+
+          # Extract request text and remove @gemini mention
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "$ISSUE_BODY" | sed 's/@gemini//g' > tmp/user_request.txt
+          elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            # For inline PR comments, comment body is in github.event.comment.body
+            echo "$COMMENT_BODY" | sed 's/@gemini//g' > tmp/user_request.txt
+          else
+            # For issue comments and PR comments
+            echo "$COMMENT_BODY" | sed 's/@gemini//g' > tmp/user_request.txt
+          fi
+
+          # Set context type
+          echo "${{ steps.context.outputs.type }}" > tmp/context_type.txt
+
+          # Store number for reference
+          echo "${{ steps.context.outputs.number }}" > tmp/issue_or_pr_number.txt
+
+      - name: 'Get issue context (if issue comment)'
+        if: steps.context.outputs.type == 'issue' && github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.number }}
+        run: |
+          # Get the issue details (body)
+          gh issue view $ISSUE_NUMBER --json body --jq '.body' > tmp/issue_body.txt
+
+          # Get comment history
+          gh issue view $ISSUE_NUMBER --json comments --jq '.comments[] | "[\(.author.login) - \(.createdAt)]:\n\(.body)\n---"' > tmp/issue_comments.txt
+
+      - name: 'Get PR context (if PR comment)'
+        if: steps.context.outputs.type == 'pr_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.context.outputs.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_DIFF_HUNK: ${{ github.event.comment.diff_hunk }}
+        run: |
+          # Get the PR diff
+          gh pr diff $PR_NUMBER > tmp/pr.diff
+
+          # Get changed files list
+          gh pr view $PR_NUMBER --json files --jq '.files[].path' > tmp/changed_files.txt
+
+          # Get conversation history
+          gh pr view $PR_NUMBER --json comments --jq '.comments[] | "[\(.author.login) - \(.createdAt)]:\n\(.body)\n---"' > tmp/conversation.txt
+
+          # Check if inline comment
+          COMMENT_PATH="${{ github.event.comment.path }}"
+          if [ -n "$COMMENT_PATH" ]; then
+            echo "true" > tmp/is_inline.txt
+            echo "$COMMENT_PATH" > tmp/inline_file.txt
+            echo "${{ github.event.comment.line }}" > tmp/inline_line.txt
+            printf '%s' "$COMMENT_DIFF_HUNK" > tmp/inline_diff_hunk.txt
+
+            # Get all comments on this line (for context)
+            CURRENT_COMMENT_ID="${{ github.event.comment.id }}"
+            gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/comments | jq --argjson current_id "$CURRENT_COMMENT_ID" --argjson target_line "${{ github.event.comment.line }}" --arg target_path "$COMMENT_PATH" '[.[] | select(.line == $target_line and .path == $target_path) | {comment_id: .id, body: .body, created_at: .created_at, author: .user.login, is_current: (.id == $current_id)}] | sort_by(.created_at)' > tmp/inline_raw.json
+
+            # Store current comment details using jq
+            # Use environment variables to avoid quote escaping issues
+            BODY_ESCAPED=$(printf '%s' "$COMMENT_BODY" | jq -R -s '.')
+            DIFF_HUNK_ESCAPED=$(printf '%s' "$COMMENT_DIFF_HUNK" | jq -R -s '.')
+            jq -n --arg path "$COMMENT_PATH" --argjson line '${{ github.event.comment.line }}' --argjson body "$BODY_ESCAPED" --argjson diff_hunk "$DIFF_HUNK_ESCAPED" --argjson position '${{ github.event.comment.position }}' --argjson comment_id "$CURRENT_COMMENT_ID" '{path: $path, line: $line, body: $body, diff_hunk: $diff_hunk, position: $position, comment_id: $comment_id}' > tmp/inline_current.json
+          else
+            echo "false" > tmp/is_inline.txt
+          fi
+
+      - name: 'Create combined prompt from context'
+        run: |
+          # Create a combined prompt from all tmp files
+          # Note: GEMINI.md is auto-loaded by Gemini CLI, no need to include it
+          cat > tmp/prompt.md <<'EOF'
+          # User Request
+
+          EOF
+
+          cat tmp/user_request.txt >> tmp/prompt.md
+
+          echo "" >> tmp/prompt.md
+          echo "---" >> tmp/prompt.md
+          echo "" >> tmp/prompt.md
+          echo "# Context Type" >> tmp/prompt.md
+          echo "" >> tmp/prompt.md
+          cat tmp/context_type.txt >> tmp/prompt.md
+          echo "" >> tmp/prompt.md
+
+          # Add issue context if available
+          if [ -f tmp/issue_body.txt ]; then
+            echo "" >> tmp/prompt.md
+            echo "---" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "# Original Issue Body" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            cat tmp/issue_body.txt >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+          fi
+
+          if [ -f tmp/issue_comments.txt ]; then
+            echo "" >> tmp/prompt.md
+            echo "---" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "# Issue Comment History" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            cat tmp/issue_comments.txt >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+          fi
+
+          # Add PR context if available
+          if [ -f tmp/changed_files.txt ]; then
+            echo "" >> tmp/prompt.md
+            echo "---" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "# PR Changed Files" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            cat tmp/changed_files.txt >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+          fi
+
+          if [ -f tmp/conversation.txt ]; then
+            echo "" >> tmp/prompt.md
+            echo "---" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "# PR Conversation History" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            cat tmp/conversation.txt >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+          fi
+
+          # IMPORTANT: Put inline comment section BEFORE PR diff so Gemini sees it first
+          if [ -f tmp/is_inline.txt ] && [ "$(cat tmp/is_inline.txt)" = "true" ]; then
+            echo "" >> tmp/prompt.md
+            echo "---" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "# ⚠️ INLINE COMMENT - SPECIFIC LINE REQUEST" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "**CRITICAL INSTRUCTION**: This is an inline comment on a specific line of a specific file." >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "**PRIMARY TARGET**: \`$(cat tmp/inline_file.txt)\` at line $(cat tmp/inline_line.txt)" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "The user's comment is specifically about line $(cat tmp/inline_line.txt) in \`$(cat tmp/inline_file.txt)\`. This is the main file you should edit." >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "**Note**: You may edit other files ONLY if they are directly required to fulfill the user's request on this specific line (e.g., if the user asks to 'refactor this into a separate file'). Do NOT edit unrelated files in the PR diff just because they mention similar keywords." >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "---" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "**Target File**: \`$(cat tmp/inline_file.txt)\`" >> tmp/prompt.md
+            echo "**Target Line**: $(cat tmp/inline_line.txt)" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "## The Request" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "The user commented on line $(cat tmp/inline_line.txt) of \`$(cat tmp/inline_file.txt)\` with:" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo '```' >> tmp/prompt.md
+            cat tmp/user_request.txt >> tmp/prompt.md
+            echo '```' >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "## File Content with Line Numbers" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "Here is the current content of \`$(cat tmp/inline_file.txt)\` with line numbers:" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo '```' >> tmp/prompt.md
+            cat -n "$(cat tmp/inline_file.txt)" >> tmp/prompt.md
+            echo '```' >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "**The comment is on line $(cat tmp/inline_line.txt).**" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "## Code Context (Diff Hunk)" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "For context, here's the diff hunk around the commented line:" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo '```diff' >> tmp/prompt.md
+            cat tmp/inline_diff_hunk.txt >> tmp/prompt.md
+            echo '```' >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "## Previous Comments on This Line" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            COMMENT_COUNT=$(cat tmp/inline_raw.json | jq 'length')
+            if [ "$COMMENT_COUNT" -gt 1 ]; then
+              echo "There are previous comments on this line (for context):" >> tmp/prompt.md
+              echo "" >> tmp/prompt.md
+              echo '```json' >> tmp/prompt.md
+              cat tmp/inline_raw.json >> tmp/prompt.md
+              echo '```' >> tmp/prompt.md
+            else
+              echo "This is the only comment on this line." >> tmp/prompt.md
+            fi
+          fi
+
+          # Add PR diff ONLY if it's NOT an inline comment
+          # For inline comments, we already have the diff hunk and full file content
+          # Including the full PR diff just confuses Gemini
+          if [ -f tmp/pr.diff ] && ! ([ -f tmp/is_inline.txt ] && [ "$(cat tmp/is_inline.txt)" = "true" ]); then
+            echo "" >> tmp/prompt.md
+            echo "---" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo "# PR Diff" >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+            echo '```diff' >> tmp/prompt.md
+            cat tmp/pr.diff >> tmp/prompt.md
+            echo '```' >> tmp/prompt.md
+            echo "" >> tmp/prompt.md
+          fi
+
+          echo "Generated prompt file: tmp/prompt.md"
+          wc -l tmp/prompt.md
+
+      - name: 'Debug: Show prompt content'
+        run: |
+          echo "=== DEBUG: Full Prompt Content ==="
+          cat tmp/prompt.md
+          echo ""
+          echo "=== DEBUG: Prompt Stats ==="
+          echo "Total lines: $(wc -l < tmp/prompt.md)"
+          echo "Total bytes: $(wc -c < tmp/prompt.md)"
+          if [ -f tmp/is_inline.txt ] && [ "$(cat tmp/is_inline.txt)" = "true" ]; then
+            echo "Is inline comment: YES"
+            echo "Inline file: $(cat tmp/inline_file.txt)"
+            echo "Inline line: $(cat tmp/inline_line.txt)"
+            echo ""
+            echo "File content being sent:"
+            cat -n "$(cat tmp/inline_file.txt)" | head -20
+            echo "..."
+          else
+            echo "Is inline comment: NO"
+          fi
+          echo "=== END DEBUG ==="
+
+      - name: 'Run autonomous agent'
+        uses: ./.github/actions/run-gemini-cli-cached
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: 'gemini-3-pro-preview'
+          prompt_file: tmp/prompt.md
+          gemini_debug: 'true'
+
+      - name: 'Handle issue request'
+        if: steps.context.outputs.type == 'issue'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.number }}
+        run: |
+          # Check if any files were created in memory/ or .gemini/
+          if [ -z "$(git status --porcelain memory/ .gemini/)" ]; then
+            echo "ℹ️  No files were created or modified"
+
+            WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            if [ -f tmp/generation_summary.txt ]; then
+              SUMMARY=$(cat tmp/generation_summary.txt)
+              gh issue comment $ISSUE_NUMBER --body "$SUMMARY
+
+          🔗 [View workflow run]($WORKFLOW_URL)"
+            else
+              gh issue comment $ISSUE_NUMBER --body "⚠️ Content generation did not produce any files. Please check your request and try again.
+
+          🔗 [View workflow run]($WORKFLOW_URL)"
+            fi
+            exit 0
+          fi
+
+          # Content was created! Prepare PR
+          echo "✅ Changes detected!"
+          git status
+
+          # Create branch
+          BRANCH_NAME="issue-$ISSUE_NUMBER-$(date +%s)"
+          git checkout -b "$BRANCH_NAME"
+
+          # Stage all changes in memory/ and .gemini/ (agent decides what to modify)
+          git add memory/ .gemini/
+
+          # Commit
+          FIRST_FILE=$(git diff --staged --name-only | head -1)
+          if [ -f "$FIRST_FILE" ]; then
+            TITLE=$(grep -m 1 "^#" "$FIRST_FILE" | sed 's/^#* *//' || echo "Changes from issue")
+          else
+            TITLE="Changes from issue"
+          fi
+
+          git commit -m "Changes from issue #$ISSUE_NUMBER
+
+          $TITLE
+
+          🤖 Generated with Gemini CLI
+          Co-Authored-By: Gemini <noreply@google.com>"
+
+          # Push
+          git push -u origin "$BRANCH_NAME"
+
+          # Get summary
+          if [ -f tmp/generation_summary.txt ]; then
+            SUMMARY=$(cat tmp/generation_summary.txt)
+          else
+            SUMMARY="Changes generated based on issue request."
+          fi
+
+          # Create PR
+          gh pr create \
+            --title "Issue #$ISSUE_NUMBER" \
+            --body "## Generated from Issue
+
+          Resolves #$ISSUE_NUMBER
+
+          $SUMMARY
+
+          **Review checklist**:
+          - [ ] Changes are accurate and high quality
+          - [ ] No sensitive information included
+          - [ ] Links and references are correct
+
+          ---
+          🤖 Generated with [Gemini CLI](https://github.com/google-gemini/gemini-cli)
+
+          Co-Authored-By: Gemini <noreply@google.com>"
+
+          PR_URL=$(gh pr view --json url -q .url)
+
+          # Comment on issue
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh issue comment $ISSUE_NUMBER --body "✅ Content generated successfully!
+
+          Pull request created: $PR_URL
+
+          $SUMMARY
+
+          🔗 [View workflow run]($WORKFLOW_URL)"
+
+          echo "✅ PR created and issue updated!"
+
+      - name: 'Handle PR comment'
+        if: steps.context.outputs.type == 'pr_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.context.outputs.number }}
+        run: |
+          # Check for changes
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No changes were made"
+            HAS_CHANGES=false
+          else
+            echo "Changes detected:"
+            git status --short
+            HAS_CHANGES=true
+          fi
+
+          if [ "$HAS_CHANGES" = "true" ]; then
+            # Commit and push (stage all changes - including files modified via inline comments)
+            git add -A
+            git commit -m "Update based on feedback
+
+          Feedback: ${{ github.event.comment.body }}"
+            git push origin ${{ steps.pr_info.outputs.branch }}
+
+            # Comment with summary
+            WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            if [ -f tmp/iteration_summary.txt ]; then
+              SUMMARY=$(cat tmp/iteration_summary.txt)
+              gh pr comment $PR_NUMBER --body "✅ **Updated based on your feedback**
+
+          ### Changes Made:
+          $SUMMARY
+
+          The content has been updated. Please review the changes.
+
+          🔗 [View workflow run]($WORKFLOW_URL)"
+            else
+              gh pr comment $PR_NUMBER --body "✅ **Updated based on your feedback**
+
+          The content has been updated. Please review the changes.
+
+          🔗 [View workflow run]($WORKFLOW_URL)"
+            fi
+          else
+            # No changes
+            WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            gh pr comment $PR_NUMBER --body "ℹ️ I reviewed your feedback but didn't identify any changes needed. Could you provide more specific guidance?
+
+          🔗 [View workflow run]($WORKFLOW_URL)"
+          fi
+
+      - name: 'Handle errors'
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ steps.context.outputs.number }}
+          IS_PR: ${{ steps.context.outputs.is_pr }}
+        run: |
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          ERROR_MESSAGE="❌ **Agent execution failed**
+
+          **Common causes:**
+          1. **Invalid API key** - Verify \`GEMINI_API_KEY\` secret is set correctly
+          2. **Rate limits** - Check your quota at [Google AI Studio](https://aistudio.google.com/)
+          3. **Permissions** - Ensure workflow has write permissions (Settings → Actions → General)
+          4. **Syntax errors** - Check demand file YAML frontmatter is valid
+
+          **Next steps:**
+          - Review the [workflow logs]($WORKFLOW_URL) for specific error details
+          - Check that all [Quick Start](https://github.com/${{ github.repository }}#quick-start) steps were completed
+          - Try again or make changes manually if needed
+
+          🔗 [View detailed logs]($WORKFLOW_URL)"
+
+          if [ "$IS_PR" = "true" ]; then
+            gh pr comment $NUMBER --body "$ERROR_MESSAGE"
+          else
+            gh issue comment $NUMBER --body "$ERROR_MESSAGE"
+          fi

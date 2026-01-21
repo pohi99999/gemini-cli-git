@@ -1,0 +1,310 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'Run Gemini CLI (Cached)'
+description: 'Run Gemini CLI with optimized caching for faster execution'
+
+inputs:
+  gemini_api_key:
+    description: 'Gemini API key for authentication (required unless using Vertex AI)'
+    required: false
+  gemini_model:
+    description: 'Gemini model to use (e.g., gemini-3-pro-preview, gemini-2.5-flash)'
+    required: false
+    default: 'gemini-3-pro-preview'
+  prompt:
+    description: 'The prompt to send to Gemini CLI (inline prompt text)'
+    required: false
+  prompt_file:
+    description: 'Path to a file containing the prompt (alternative to prompt)'
+    required: false
+  settings:
+    description: 'JSON settings for Gemini CLI (optional)'
+    required: false
+    default: |
+      {
+        "autoAccept": true,
+        "model": {
+          "temperature": 0.7
+        }
+      }
+  cache_version:
+    description: 'Cache version for invalidation (increment to bust cache)'
+    required: false
+    default: 'v1'
+  # Google Cloud / Vertex AI support
+  use_vertex_ai:
+    description: 'Use Vertex AI instead of Gemini API (default: false)'
+    required: false
+    default: 'false'
+  gcp_project_id:
+    description: 'Google Cloud project ID (required when use_vertex_ai=true)'
+    required: false
+  gcp_location:
+    description: 'Google Cloud location (e.g., us-central1)'
+    required: false
+    default: 'us-central1'
+  google_api_key:
+    description: 'Vertex AI API key (alternative to gemini_api_key when use_vertex_ai=true)'
+    required: false
+  gcp_access_token:
+    description: 'Google Cloud access token (from auth action)'
+    required: false
+  gemini_debug:
+    description: 'Enable debug logging and output streaming'
+    required: false
+    default: 'false'
+
+outputs:
+  stdout:
+    description: 'Standard output from Gemini CLI'
+    value: ${{ steps.run_gemini.outputs.stdout }}
+  stderr:
+    description: 'Standard error from Gemini CLI'
+    value: ${{ steps.run_gemini.outputs.stderr }}
+  success:
+    description: 'Whether Gemini CLI succeeded'
+    value: ${{ steps.run_gemini.outputs.success }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Cache Gemini CLI installation'
+      id: cache_gemini
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.npm
+          /usr/local/lib/node_modules/@google/gemini-cli
+          /usr/local/bin/gemini
+        key: gemini-cli-${{ runner.os }}-latest-${{ inputs.cache_version }}
+        restore-keys: |
+          gemini-cli-${{ runner.os }}-latest-
+          gemini-cli-${{ runner.os }}-
+
+    - name: 'Install Gemini CLI'
+      if: steps.cache_gemini.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        VERSION_INPUT="latest"
+
+        echo "Installing Gemini CLI from npm: @google/gemini-cli@${VERSION_INPUT}"
+        npm install --silent --no-audit --prefer-offline --global @google/gemini-cli@"${VERSION_INPUT}"
+
+        echo "Verifying installation:"
+        if command -v gemini >/dev/null 2>&1; then
+          gemini --version || echo "Gemini CLI installed successfully (version command not available)"
+        else
+          echo "Error: Gemini CLI not found in PATH"
+          exit 1
+        fi
+
+    - name: 'Install Extensions'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [[ -f .gemini/extensions.txt ]]; then
+          echo "=== Installing Gemini CLI Extensions ==="
+          while IFS= read -r extension || [[ -n "$extension" ]]; do
+            # Skip empty lines and comments
+            [[ -z "$extension" || "$extension" =~ ^[[:space:]]*# ]] && continue
+
+            extension=$(echo "$extension" | xargs)
+            echo "Installing extension: $extension"
+            echo "Y" | gemini extensions install "$extension" || echo "Warning: Failed to install $extension"
+          done < .gemini/extensions.txt
+        else
+          echo "No extensions.txt found, skipping extension installation"
+        fi
+
+    - name: 'Configure Gemini CLI'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        mkdir -p .gemini/
+
+        WORKSPACE_DIR="$(pwd)"
+
+        # Start with user's settings.json or empty object
+        if [[ -f .gemini/settings.json ]]; then
+          echo "Using existing .gemini/settings.json as base"
+          BASE_SETTINGS=$(cat .gemini/settings.json)
+        else
+          echo "No .gemini/settings.json found, using defaults"
+          BASE_SETTINGS="{}"
+        fi
+
+        # Add runtime overrides (rootDirectory, autoAccept, telemetry if debug)
+        FINAL_SETTINGS=$(echo "$BASE_SETTINGS" | jq \
+          --arg rootDir "$WORKSPACE_DIR" \
+          '. + {
+            "rootDirectory": $rootDir,
+            "autoAccept": true
+          }')
+
+        # Add telemetry if debug mode
+        if [[ "${{ inputs.gemini_debug }}" == "true" ]]; then
+          FINAL_SETTINGS=$(echo "$FINAL_SETTINGS" | jq '. + {
+            "telemetry": {
+              "enabled": true,
+              "target": "local",
+              "outfile": ".gemini/telemetry.log",
+              "logPrompts": true
+            }
+          }')
+        fi
+
+        # Save original user settings (agent can edit this file)
+        if [[ -f .gemini/settings.json ]]; then
+          cp .gemini/settings.json .gemini/.user-settings.json
+        else
+          echo '{}' > .gemini/.user-settings.json
+        fi
+
+        # Write merged settings for Gemini CLI runtime
+        echo "$FINAL_SETTINGS" | jq '.' > .gemini/settings.json
+
+        echo "=== Gemini CLI settings.json (runtime) ==="
+        cat .gemini/settings.json
+
+    - name: 'Run Gemini CLI'
+      id: run_gemini
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+        GEMINI_MODEL: ${{ inputs.gemini_model }}
+        SURFACE: 'gemini-git'
+        # Vertex AI / Google Cloud support
+        GOOGLE_GENAI_USE_VERTEXAI: ${{ inputs.use_vertex_ai }}
+        GOOGLE_CLOUD_PROJECT: ${{ inputs.gcp_project_id }}
+        GOOGLE_CLOUD_LOCATION: ${{ inputs.gcp_location }}
+        GOOGLE_API_KEY: ${{ inputs.google_api_key }}
+        GOOGLE_CLOUD_ACCESS_TOKEN: ${{ inputs.gcp_access_token }}
+      run: |
+        set -euo pipefail
+
+        # Create temporary files for output
+        TEMP_STDOUT="$(mktemp -p "${RUNNER_TEMP}" gemini-out.XXXXXXXXXX)"
+        TEMP_STDERR="$(mktemp -p "${RUNNER_TEMP}" gemini-err.XXXXXXXXXX)"
+
+        function cleanup {
+          rm -f "${TEMP_STDOUT}" "${TEMP_STDERR}"
+        }
+        trap cleanup EXIT
+
+        # Keep track of success/failure
+        FAILED=false
+
+        # Debug: Check what we're working with
+        echo "=== Debug: Prompt Configuration ==="
+        echo "prompt_file input: '${{ inputs.prompt_file }}'"
+        echo "prompt input: '${{ inputs.prompt }}'"
+        if [ -n "${{ inputs.prompt_file }}" ]; then
+          echo "Using prompt_file: ${{ inputs.prompt_file }}"
+          if [ -f "${{ inputs.prompt_file }}" ]; then
+            echo "File exists: YES"
+            echo "File size: $(wc -c < "${{ inputs.prompt_file }}") bytes"
+            echo "File lines: $(wc -l < "${{ inputs.prompt_file }}") lines"
+            echo "First 5 lines:"
+            head -5 "${{ inputs.prompt_file }}"
+          else
+            echo "File exists: NO"
+            echo "ERROR: prompt_file specified but file does not exist!"
+          fi
+        else
+          echo "Using inline prompt"
+        fi
+        echo "=== End Debug ==="
+
+        # Run Gemini CLI with the prompt (with optional debug streaming)
+        if [[ "${{ inputs.gemini_debug }}" == "true" ]]; then
+          echo "::warning::Gemini CLI debug logging is enabled. This will stream responses, which could reveal sensitive information if processed with untrusted inputs."
+          # Use --debug for verbose logging and --output-format stream-json for real-time event streaming
+          if [ -n "${{ inputs.prompt_file }}" ]; then
+            # Use file directly via stdin
+            if ! { cat "${{ inputs.prompt_file }}" | gemini --debug --yolo --output-format stream-json 2> >(tee "${TEMP_STDERR}" >&2) | tee "${TEMP_STDOUT}"; }; then
+              FAILED=true
+            fi
+          else
+            # Use inline prompt
+            if ! { gemini --debug --yolo --output-format stream-json --prompt '${{ inputs.prompt }}' 2> >(tee "${TEMP_STDERR}" >&2) | tee "${TEMP_STDOUT}"; }; then
+              FAILED=true
+            fi
+          fi
+        else
+          if [ -n "${{ inputs.prompt_file }}" ]; then
+            # Use file directly via stdin
+            if ! cat "${{ inputs.prompt_file }}" | gemini --yolo 2> "${TEMP_STDERR}" 1> "${TEMP_STDOUT}"; then
+              FAILED=true
+            fi
+          else
+            # Use inline prompt
+            if ! gemini --yolo --prompt '${{ inputs.prompt }}' 2> "${TEMP_STDERR}" 1> "${TEMP_STDOUT}"; then
+              FAILED=true
+            fi
+          fi
+        fi
+
+        # Restore user settings.json if agent modified it
+        # Agent edits the runtime settings.json, we need to extract user changes
+        if [[ -f .gemini/.user-settings.json ]] && [[ -f .gemini/settings.json ]]; then
+          # Extract mcpServers from current settings (may have been edited by agent)
+          CURRENT_MCP=$(jq '.mcpServers // {}' .gemini/settings.json)
+          ORIGINAL_MCP=$(jq '.mcpServers // {}' .gemini/.user-settings.json)
+
+          # If they differ, agent made changes - update user settings
+          if [[ "$CURRENT_MCP" != "$ORIGINAL_MCP" ]]; then
+            echo "Agent modified MCP servers configuration"
+            jq --argjson mcp "$CURRENT_MCP" '.mcpServers = $mcp' .gemini/.user-settings.json > .gemini/settings.json
+          else
+            # Restore original
+            cp .gemini/.user-settings.json .gemini/settings.json
+          fi
+        fi
+
+        # Create artifacts directory and copy logs
+        mkdir -p gemini-artifacts
+        cp "${TEMP_STDOUT}" gemini-artifacts/stdout.log
+        cp "${TEMP_STDERR}" gemini-artifacts/stderr.log
+        if [[ -f .gemini/telemetry.log ]]; then
+          cp .gemini/telemetry.log gemini-artifacts/telemetry.log
+        else
+          touch gemini-artifacts/telemetry.log
+        fi
+
+        # Set outputs using multiline format
+        echo "stdout<<EOF" >> $GITHUB_OUTPUT
+        cat "${TEMP_STDOUT}" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        echo "stderr<<EOF" >> $GITHUB_OUTPUT
+        cat "${TEMP_STDERR}" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        if [[ "${FAILED}" = true ]]; then
+          echo "success=false" >> $GITHUB_OUTPUT
+          LAST_LINE="$(tail -n1 "${TEMP_STDERR}")"
+          echo "::error title=Gemini CLI execution failed::${LAST_LINE}"
+          echo "See logs for more details"
+          cat "${TEMP_STDERR}"
+          exit 1
+        else
+          echo "success=true" >> $GITHUB_OUTPUT
+          echo "=== Gemini CLI Output ==="
+          cat "${TEMP_STDOUT}"
+        fi
