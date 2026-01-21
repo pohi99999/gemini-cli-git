@@ -17,7 +17,7 @@ name: 'Agent on Schedule'
 # Runs scheduled demands via cron
 on:
   schedule:
-    - cron: '0 9 * * *'  # 9 AM UTC daily
+    - cron: '0 22 * * *'  # 10 PM (22:00) UTC daily
   workflow_dispatch:  # Allow manual trigger for testing
     inputs:
       demand:
