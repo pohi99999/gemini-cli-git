@@ -46,9 +46,11 @@ limitations under the License.
 **Perfect for:** Anything you can think of! Extend with MCP servers and extensions.
 
 **Example use cases:**<br>
-🔍 Code Reviews • 📰 Daily Newsletter • 📝 Auto-sync Documentation • 📊 Weekly Reports • 🌤️ Weather Updates
+🔍 Code Reviews • 📰 Daily Newsletter • 📝 Auto-sync Documentation • 📊 Weekly Reports • 🌤️ Weather Updates • 🏥 Repository Health Checks
 
 **Sample included:** This template includes a [working example skill](memory/skills/gemini_cli_tips/) that generates daily tips about Gemini CLI. Use it as a reference for building your own skills!
+
+**🏥 Repository Health Monitoring:** This template also includes a [repository health check skill](memory/skills/repo_health_check/) that monitors the mcp-brunella-core repository daily at 22:00 UTC. It checks build status, tests, dependencies, code quality, and provides actionable suggestions when problems are found.
 
 **💬 Interactive mode:** You can also use [Gemini CLI](https://github.com/google-gemini/gemini-cli) in this same repo for real-time chat (`npm install -g @google/gemini-cli && gemini`). Autonomous for scheduled tasks, interactive for quick questions.
 
@@ -212,11 +214,12 @@ Comment Confirmation
 
 ### Change Schedule
 
-Edit `.github/workflows/agent-scheduler.yml`:
+The default schedule runs daily at 22:00 UTC (10 PM). Edit `.github/workflows/agent-scheduler.yml`:
 ```yaml
 on:
   schedule:
-    - cron: '0 9 * * 1'  # 9 AM UTC every Monday
+    - cron: '0 22 * * *'  # 10 PM UTC daily
+    # Example: '0 9 * * 1'  # 9 AM UTC every Monday
 ```
 
 Use [crontab.guru](https://crontab.guru/) for custom schedules.
